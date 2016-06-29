@@ -3151,5 +3151,8 @@ finally:
     except NameError:
         pass
     
+    if gp_expand is not None:
+        gp_expand.shutdown()
+
     coverage.stop()
     coverage.generate_report()
