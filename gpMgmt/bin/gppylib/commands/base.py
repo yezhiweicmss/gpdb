@@ -197,7 +197,6 @@ class Worker(Thread):
                 if try_count == 5:
                     self.logger.debug("[%s] try and get work from queue..." % self.name)
                     try_count = 0
-                    #self.shouldStop = True
                 
                 if self.shouldStop:
                     self.logger.debug('[%s] stopping' % self.name)
@@ -223,7 +222,6 @@ class Worker(Thread):
                         return
                       
             except Empty:                
-                try_count += 1
                 if self.shouldStop:
                     self.logger.debug("[%s] stopping" % self.name)
                     return
