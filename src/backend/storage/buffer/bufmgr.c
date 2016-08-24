@@ -87,6 +87,7 @@ static bool IsForInput;
 /* local state for LockBufferForCleanup */
 static volatile BufferDesc *PinCountWaitBuf = NULL;
 
+
 static Buffer ReadBuffer_common(SMgrRelation reln, bool isLocalBuf,
 				  bool isTemp, BlockNumber blockNum, bool zeroPage,
 				  BufferAccessStrategy strategy,
@@ -101,11 +102,9 @@ static bool StartBufferIO(volatile BufferDesc *buf, bool forInput);
 static void TerminateBufferIO(volatile BufferDesc *buf, bool clear_dirty,
 				  int set_flag_bits);
 static void buffer_write_error_callback(void *arg);
-
 static volatile BufferDesc *BufferAlloc(SMgrRelation reln, BlockNumber blockNum,
 			BufferAccessStrategy strategy,
 			bool *foundPtr);
-
 static void FlushBuffer(volatile BufferDesc *buf, SMgrRelation reln);
 static void AtProcExit_Buffers(int code, Datum arg);
 
@@ -196,7 +195,7 @@ ReadBuffer(Relation reln, BlockNumber blockNum)
 									 blockNum,
 									 false, /* zeroPage */
 									 NULL, /* strategy */
-									 NULL,
+									 RelationGetRelationName(reln),
 									 &isHit);
 
 	if (isHit)
@@ -788,14 +787,9 @@ BufferAlloc(SMgrRelation smgr,
  *
  * The buffer could get reclaimed by someone else while we are waiting
  * to acquire the necessary locks; if so, don't mess it up.
- *
- * Return true if buffer is indeed invalidated, false otherwise. Returning
- * false is usally not consequential as it means that the buf cannot be
- * invalidated because someone else is using it. Caller should just forget
- * about this buf.
  */
-static bool
-InvalidateBuffer(volatile BufferDesc *buf, bool putInFreeList, bool spin)
+static void
+InvalidateBuffer(volatile BufferDesc *buf)
 {
 	BufferTag	oldTag;
 	uint32		oldHash;		/* hash value for oldTag */
@@ -831,21 +825,17 @@ retry:
 	{
 		UnlockBufHdr(buf);
 		LWLockRelease(oldPartitionLock);
-		return false;
+		return;
 	}
 
 	/*
-	 * In the spin case, we assume the only reason for it to be pinned is that someone else is
+	 * We assume the only reason for it to be pinned is that someone else is
 	 * flushing the page out.  Wait for them to finish.  (This could be an
 	 * infinite loop if the refcount is messed up... it would be nice to time
 	 * out after awhile, but there seems no way to be sure how many loops may
 	 * be needed.  Note that if the other guy has pinned the buffer but not
 	 * yet done StartBufferIO, WaitIO will fall through and we'll effectively
 	 * be busy-looping here.)
-	 *
-	 * For the non-spin (GP) case, the other party may have a refcount for other reasons
-	 *   since invalidate will be called not just for dropped relation and those kinds of
-	 *   operations.
 	 */
 	if (buf->refcount != 0)
 	{
@@ -854,22 +844,8 @@ retry:
 		/* safety check: should definitely not be our *own* pin */
 		insist_log(PrivateRefCount[buf->buf_id] == 0, "buffer is pinned in InvalidateBuffer");
 
-		if(spin)
-		{
-			WaitIO(buf);
-			goto retry;
-		}
-		else
-			return false;
-	}
-	if ( ! spin)
-	{
-		if ( buf->flags & BM_DIRTY)
-		{
-			UnlockBufHdr(buf);
-			LWLockRelease(oldPartitionLock);
-			return false;
-		}
+		WaitIO(buf);
+		goto retry;
 	}
 
 	/*
@@ -897,10 +873,7 @@ retry:
 	/*
 	 * Insert the buffer at the head of the list of free buffers.
 	 */
-	if (putInFreeList)
-		StrategyFreeBuffer(buf);
-
-	return true;
+	StrategyFreeBuffer(buf);
 }
 
 /*
@@ -969,7 +942,7 @@ ReadBufferWithStrategy(Relation reln, BlockNumber blockNum,
 									 blockNum,
 									 false, /* zeroPage */
 									 strategy,
-									 NULL,
+									 RelationGetRelationName(reln),
 									 &isHit);
 
 	if (isHit)
@@ -1007,7 +980,7 @@ ReadOrZeroBuffer(Relation reln, BlockNumber blockNum)
 									 blockNum,
 									 true, /* zeroPage */
 									 NULL, /* strategy */
-									 NULL,
+									 RelationGetRelationName(reln),
 									 &isHit);
 
 	if (isHit)
@@ -1214,7 +1187,6 @@ BufferSync(int flags)
 
 	/* Make sure we can handle the pin inside SyncOneBuffer */
 	ResourceOwnerEnlargeBuffers(CurrentResourceOwner);
-
 
 	/*
 	 * Loop over all buffers, and mark the ones that need to be written with
@@ -1664,7 +1636,7 @@ SyncOneBuffer(int buf_id, bool skip_recently_used)
 
 		return result;
 	}
-	
+
 	/*
 	 * Pin it, share-lock it, write it.  (FlushBuffer will do nothing if the
 	 * buffer is clean by the time we've locked it.)
@@ -2116,12 +2088,12 @@ RelationTruncate(Relation rel, BlockNumber nblocks, bool markPersistentAsPhysica
  * --------------------------------------------------------------------
  */
 void
-DropRelFileNodeBuffers(RelFileNode rnode, bool isLocalBuf,
+DropRelFileNodeBuffers(RelFileNode rnode, bool istemp,
 					   BlockNumber firstDelBlock)
 {
 	int			i;
 
-	if (isLocalBuf) /*CDB*/
+	if (istemp)
 	{
 		DropRelFileNodeLocalBuffers(rnode, firstDelBlock);
 		return;
@@ -2134,7 +2106,7 @@ DropRelFileNodeBuffers(RelFileNode rnode, bool isLocalBuf,
 		LockBufHdr(bufHdr);
 		if (RelFileNodeEquals(bufHdr->tag.rnode, rnode) &&
 			bufHdr->tag.blockNum >= firstDelBlock)
-			InvalidateBuffer(bufHdr, true, true);	/* releases spinlock */
+			InvalidateBuffer(bufHdr);	/* releases spinlock */
 		else
 			UnlockBufHdr(bufHdr);
 	}
@@ -2169,7 +2141,7 @@ DropDatabaseBuffers(Oid tblspc, Oid dbid)
 		if (!OidIsValid(tblspc) || bufHdr->tag.rnode.spcNode == tblspc)
 		{
 			if (bufHdr->tag.rnode.dbNode == dbid)
-				InvalidateBuffer(bufHdr, true, true);	/* releases spinlock */
+				InvalidateBuffer(bufHdr);	/* releases spinlock */
 			else
 				UnlockBufHdr(bufHdr);
 		}
@@ -2400,7 +2372,6 @@ ReleaseBuffer(Buffer buffer)
 	else
 		UnpinBuffer(bufHdr, false);
 }
-
 
 /*
  * UnlockReleaseBuffer -- release the content lock and pin on a buffer

@@ -17,6 +17,7 @@
 #include "tcop/tcopprot.h"
 #include "cdb/cdbdisp.h"
 #include "cdb/cdbdisp_thread.h"
+#include "cdb/cdbdisp_async.h"
 #include "cdb/cdbdispatchresult.h"
 #include "cdb/cdbfts.h"
 #include "cdb/cdbgang.h"
@@ -29,6 +30,8 @@
 CdbDispatchDirectDesc default_dispatch_direct_desc = { false, 0, {0}};
 
 static void cdbdisp_clearGangActiveFlag(CdbDispatcherState *ds);
+
+static DispatcherInternalFuncs *pDispatchFuncs = NULL;
 
 /*
  * cdbdisp_dispatchToGang:
@@ -94,7 +97,7 @@ cdbdisp_dispatchToGang(struct CdbDispatcherState *ds,
 	 * WIP: will use a function pointer for implementation later, currently just use an internal function to move dispatch
 	 * thread related code into a separate file.
 	 */
-	cdbdisp_dispatchToGang_internal(ds, gp, sliceIndex, disp_direct);
+	(pDispatchFuncs->dispatchToGang)(ds, gp, sliceIndex, disp_direct);
 }
 
 /*
@@ -111,7 +114,7 @@ CdbCheckDispatchResult(struct CdbDispatcherState *ds,
 {
 	PG_TRY();
 	{
-		CdbCheckDispatchResult_internal(ds, waitMode);
+		(pDispatchFuncs->checkResults)(ds, waitMode);
 	}
 	PG_CATCH();
 	{
@@ -141,6 +144,38 @@ CdbCheckDispatchResult(struct CdbDispatcherState *ds,
 }
 
 /*
+ * cdbdisp_getDispatchResults:
+ *
+ * Block until all QEs return results or report errors.
+ *
+ * Return Values:
+ *   Return NULL If one or more QEs got Error in which case qeErrorMsg contain
+ *   QE error messages.
+ */
+struct CdbDispatchResults *
+cdbdisp_getDispatchResults(struct CdbDispatcherState *ds, StringInfoData *qeErrorMsg)
+{
+    int errorcode;
+
+    if (!ds || !ds->primaryResults)
+        return NULL;
+
+    /* wait QEs to return results or report errors*/
+    CdbCheckDispatchResult(ds, DISPATCH_WAIT_NONE);
+
+    /* check if any error reported */
+    errorcode = ds->primaryResults->errcode;
+
+    if (errorcode)
+    {
+        cdbdisp_dumpDispatchResults(ds->primaryResults, qeErrorMsg);
+        return NULL;
+    }
+
+    return ds->primaryResults;
+}
+
+/*
  * Wait for all QEs to finish, then report any errors from the given
  * CdbDispatchResults objects and free them. If not all QEs in the
  * associated gang(s) executed the command successfully, throws an
@@ -149,14 +184,10 @@ CdbCheckDispatchResult(struct CdbDispatcherState *ds,
  * instead call CdbCheckDispatchResult(), etc., directly.
  */
 void
-cdbdisp_finishCommand(struct CdbDispatcherState *ds,
-					  void (*handle_results_callback) (CdbDispatchResults *
-													   primaryResults,
-													   void *ctx), void *ctx)
+cdbdisp_finishCommand(struct CdbDispatcherState *ds)
 {
-	StringInfoData buf;
-	int errorcode = 0;
-
+	StringInfoData qeErrorMsg;
+	CdbDispatchResults *pr = NULL;
 	/*
 	 * If cdbdisp_dispatchToGang() wasn't called, don't wait.
 	 */
@@ -178,48 +209,33 @@ cdbdisp_finishCommand(struct CdbDispatcherState *ds,
 	/*
 	 * Wait for all QEs to finish. Don't cancel them.
 	 */
-	CdbCheckDispatchResult(ds, DISPATCH_WAIT_NONE);
+	initStringInfo(&qeErrorMsg);
+
+	pr = cdbdisp_getDispatchResults(ds, &qeErrorMsg);
+
+	if (!pr)
+	{
+		cdbdisp_destroyDispatcherState(ds);
+
+		PG_TRY();
+		{
+			ereport(ERROR, (errcode(ERRCODE_INTERNAL_ERROR),
+					errOmitLocation(true), errmsg("%s", qeErrorMsg.data)));
+		}
+		PG_CATCH();
+		{
+			pfree(qeErrorMsg.data);
+			PG_RE_THROW();
+		}
+		PG_END_TRY();
+	}
+
+	pfree(qeErrorMsg.data);
 
 	/*
 	 * If no errors, free the CdbDispatchResults objects and return.
 	 */
-	if (ds->primaryResults)
-		errorcode = ds->primaryResults->errcode;
-
-	if (!errorcode)
-	{
-		/*
-		 * Call the callback function to handle the results
-		 */
-		if (handle_results_callback != NULL)
-			handle_results_callback(ds->primaryResults, ctx);
-
-		cdbdisp_destroyDispatcherState(ds);
-		return;
-	}
-
-	/*
-	 * Format error messages from the primary gang.
-	 */
-	initStringInfo(&buf);
-	cdbdisp_dumpDispatchResults(ds->primaryResults, &buf);
-
 	cdbdisp_destroyDispatcherState(ds);
-
-	/*
-	 * Too bad, our gang got an error.
-	 */
-	PG_TRY();
-	{
-		ereport(ERROR, (errcode(errorcode),
-						errOmitLocation(true), errmsg("%s", buf.data)));
-	}
-	PG_CATCH();
-	{
-		pfree(buf.data);
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
 }
 
 /*
@@ -294,7 +310,7 @@ cdbdisp_handleError(struct CdbDispatcherState *ds)
 		 */
 		PG_TRY();
 		{
-			cdbdisp_finishCommand(ds, NULL, NULL);
+			cdbdisp_finishCommand(ds);
 		}
 		PG_CATCH();
 		{
@@ -313,6 +329,8 @@ cdbdisp_handleError(struct CdbDispatcherState *ds)
 	}
 }
 
+
+
 /*
  * Allocate memory and initialize CdbDispatcherState.
  *
@@ -323,25 +341,27 @@ cdbdisp_handleError(struct CdbDispatcherState *ds)
 void
 cdbdisp_makeDispatcherState(CdbDispatcherState *ds,
 							int maxSlices,
-							bool cancelOnError)
+							bool cancelOnError,
+							char *queryText,
+							int queryTextLen)
 {
 	MemoryContext oldContext = NULL;
 
 	Assert(ds != NULL);
-	Assert(ds->dispatchStateContext == NULL);
-	Assert(ds->dispatchThreads == NULL);
+	Assert(ds->dispatchParams == NULL);
 	Assert(ds->primaryResults == NULL);
 
-	ds->dispatchStateContext = AllocSetContextCreate(TopMemoryContext,
-													 "Dispatch Context",
-													 ALLOCSET_DEFAULT_MINSIZE,
-													 ALLOCSET_DEFAULT_INITSIZE,
-													 ALLOCSET_DEFAULT_MAXSIZE);
+	if (ds->dispatchStateContext == NULL)
+		ds->dispatchStateContext = AllocSetContextCreate(TopMemoryContext,
+														 "Dispatch Context",
+														 ALLOCSET_DEFAULT_MINSIZE,
+														 ALLOCSET_DEFAULT_INITSIZE,
+														 ALLOCSET_DEFAULT_MAXSIZE);
 
 	oldContext = MemoryContextSwitchTo(ds->dispatchStateContext);
-	ds->primaryResults = cdbdisp_makeDispatchResults(maxSlices,
-													 cancelOnError);
-	ds->dispatchThreads = cdbdisp_makeDispatchThreads(maxSlices);
+	ds->primaryResults = cdbdisp_makeDispatchResults(maxSlices, cancelOnError);
+	ds->dispatchParams = (pDispatchFuncs->makeDispatchParams)(maxSlices, queryText, queryTextLen);
+
 	MemoryContextSwitchTo(oldContext);
 }
 
@@ -354,6 +374,9 @@ cdbdisp_makeDispatcherState(CdbDispatcherState *ds,
 void
 cdbdisp_destroyDispatcherState(CdbDispatcherState *ds)
 {
+	if (!ds)
+		return;
+
 	CdbDispatchResults *results = ds->primaryResults;
 
 	if (results != NULL && results->resultArray != NULL)
@@ -374,10 +397,14 @@ cdbdisp_destroyDispatcherState(CdbDispatcherState *ds)
 	}
 
 	ds->dispatchStateContext = NULL;
-	ds->dispatchThreads = NULL;
+	ds->dispatchParams = NULL;
 	ds->primaryResults = NULL;
 }
 
+void cdbdisp_cancelDispatch(CdbDispatcherState *ds)
+{
+    CdbCheckDispatchResult(ds, DISPATCH_WAIT_CANCEL);
+}
 /*
  * Clear our "active" flags; so that we know that the writer gangs are busy -- and don't stomp on
  * internal dispatcher structures.
@@ -389,4 +416,25 @@ cdbdisp_clearGangActiveFlag(CdbDispatcherState *ds)
 	{
 		ds->primaryResults->writer_gang->dispatcherActive = false;
 	}
+}
+
+bool cdbdisp_checkForCancel(CdbDispatcherState * ds)
+{
+	if (pDispatchFuncs == NULL || pDispatchFuncs->checkForCancel == NULL)
+		return false;
+	return (pDispatchFuncs->checkForCancel)(ds);
+}
+
+void cdbdisp_onProcExit(void)
+{
+	if (pDispatchFuncs != NULL && pDispatchFuncs->procExitCallBack != NULL)
+		(pDispatchFuncs->procExitCallBack)();
+}
+
+void cdbdisp_setAsync(bool async)
+{
+	if (async)
+		pDispatchFuncs = &DispatcherAsyncFuncs;
+	else
+		pDispatchFuncs = &DispatcherSyncFuncs;
 }

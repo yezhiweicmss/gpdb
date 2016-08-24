@@ -58,103 +58,82 @@ TEST_F(S3BucketReaderTest, OpenURL) {
     EXPECT_NO_THROW(bucketReader->open(params));
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_normal) {
-    EXPECT_NO_THROW(this->bucketReader->validateURL(
+TEST_F(S3BucketReaderTest, OpenThrowExceptionWhenS3InterfaceIsNULL) {
+    bucketReader->setS3interface(NULL);
+
+    string url = "https://s3-us-east-2.amazonaws.com/s3test.pivotal.io/whatever";
+    params.setUrlToLoad(url);
+    EXPECT_THROW(bucketReader->open(params), std::runtime_error);
+}
+
+TEST_F(S3BucketReaderTest, ParseURL_normal) {
+    EXPECT_NO_THROW(this->bucketReader->parseURL(
         "s3://s3-us-west-2.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
     EXPECT_EQ("us-west-2", this->bucketReader->getRegion());
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("dataset1/normal", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_NoPrefixAndSlash) {
+TEST_F(S3BucketReaderTest, ParseURL_NoPrefixAndSlash) {
     EXPECT_NO_THROW(
-        this->bucketReader->validateURL("s3://s3-us-west-2.amazonaws.com/s3test.pivotal.io"));
+        this->bucketReader->parseURL("s3://s3-us-west-2.amazonaws.com/s3test.pivotal.io"));
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_NoPrefix) {
+TEST_F(S3BucketReaderTest, ParseURL_NoPrefix) {
     EXPECT_NO_THROW(
-        this->bucketReader->validateURL("s3://s3-us-west-2.amazonaws.com/s3test.pivotal.io/"));
+        this->bucketReader->parseURL("s3://s3-us-west-2.amazonaws.com/s3test.pivotal.io/"));
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_default) {
+TEST_F(S3BucketReaderTest, ParseURL_default) {
     EXPECT_NO_THROW(
-        this->bucketReader->validateURL("s3://s3.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
+        this->bucketReader->parseURL("s3://s3.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
     EXPECT_EQ("external-1", this->bucketReader->getRegion());
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("dataset1/normal", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_useast1) {
-    EXPECT_NO_THROW(this->bucketReader->validateURL(
+TEST_F(S3BucketReaderTest, ParseURL_useast1) {
+    EXPECT_NO_THROW(this->bucketReader->parseURL(
         "s3://s3-us-east-1.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
     EXPECT_EQ("external-1", this->bucketReader->getRegion());
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("dataset1/normal", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_eucentral1) {
-    EXPECT_NO_THROW(this->bucketReader->validateURL(
+TEST_F(S3BucketReaderTest, ParseURL_eucentral1) {
+    EXPECT_NO_THROW(this->bucketReader->parseURL(
         "s3://s3.eu-central-1.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
     EXPECT_EQ("eu-central-1", this->bucketReader->getRegion());
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("dataset1/normal", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_eucentral11) {
-    EXPECT_NO_THROW(this->bucketReader->validateURL(
+TEST_F(S3BucketReaderTest, ParseURL_eucentral11) {
+    EXPECT_NO_THROW(this->bucketReader->parseURL(
         "s3://s3-eu-central-1.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
     EXPECT_EQ("eu-central-1", this->bucketReader->getRegion());
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("dataset1/normal", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_apnortheast2) {
-    EXPECT_NO_THROW(this->bucketReader->validateURL(
+TEST_F(S3BucketReaderTest, ParseURL_apnortheast2) {
+    EXPECT_NO_THROW(this->bucketReader->parseURL(
         "s3://s3.ap-northeast-2.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
     EXPECT_EQ("ap-northeast-2", this->bucketReader->getRegion());
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("dataset1/normal", this->bucketReader->getPrefix());
 }
 
-TEST_F(S3BucketReaderTest, ValidateURL_apnortheast21) {
-    EXPECT_NO_THROW(this->bucketReader->validateURL(
+TEST_F(S3BucketReaderTest, ParseURL_apnortheast21) {
+    EXPECT_NO_THROW(this->bucketReader->parseURL(
         "s3://s3-ap-northeast-2.amazonaws.com/s3test.pivotal.io/dataset1/normal"));
     EXPECT_EQ("ap-northeast-2", this->bucketReader->getRegion());
     EXPECT_EQ("s3test.pivotal.io", this->bucketReader->getBucket());
     EXPECT_EQ("dataset1/normal", this->bucketReader->getPrefix());
-}
-
-TEST_F(S3BucketReaderTest, ListBucketWithRetryThrowException) {
-    EXPECT_THROW(bucketReader->listBucketWithRetry(0), std::runtime_error);
-}
-
-TEST_F(S3BucketReaderTest, ListBucketWithRetryThrowExceptionWhenS3InterfaceIsNULL) {
-    bucketReader->setS3interface(NULL);
-    EXPECT_THROW(bucketReader->listBucketWithRetry(1), std::runtime_error);
-}
-
-TEST_F(S3BucketReaderTest, ListBucketWithRetry) {
-    ListBucketResult* result = new ListBucketResult();
-
-    EXPECT_CALL(s3interface, listBucket(_, _, _, _, _)).Times(1).WillOnce(Return(result));
-
-    EXPECT_NE((void*)NULL, bucketReader->listBucketWithRetry(1));
-}
-
-TEST_F(S3BucketReaderTest, ListBucketWithRetries) {
-    ListBucketResult* result = new ListBucketResult();
-
-    EXPECT_CALL(s3interface, listBucket(_, _, _, _, _))
-        .Times(3)
-        .WillOnce(Return((ListBucketResult*)NULL))
-        .WillOnce(Return((ListBucketResult*)NULL))
-        .WillOnce(Return(result));
-
-    EXPECT_EQ(result, bucketReader->listBucketWithRetry(3));
 }
 
 TEST_F(S3BucketReaderTest, ReaderThrowExceptionWhenUpstreamReaderIsNULL) {

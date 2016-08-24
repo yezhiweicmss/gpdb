@@ -291,68 +291,6 @@ ProcessQuery(Portal portal,
 	/* Now take care of any queued AFTER triggers */
 	AfterTriggerEndQuery(queryDesc->estate);
 
-	/*
-	 * MPP-4145: convert qualifying "delete from" queries into
-	 * truncate, after the delete has run -- this will return the
-	 * correct number of rows to the client, and will also free the
-	 * underlying storage.
-	 *
-	 * We save Oid before ending query.
-	 *
-	 * If we're deleting a complete table in parallel, add on a
-	 * truncate step after we've done the delete -- this frees the
-	 * storage whereas the delete itself does not.
-	 *
-	 * A delete of the table should already have the appropriate
-	 * locks (?), so we ought not deadlock here.
-	 */
-	if (Gp_role == GP_ROLE_DISPATCH &&
-		gp_enable_delete_as_truncate &&
-		queryDesc->plannedstmt->planTree != NULL &&
-		queryDesc->plannedstmt->planTree->dispatch == DISPATCH_PARALLEL &&
-		queryDesc->operation == CMD_DELETE &&
-		list_length(queryDesc->plannedstmt->resultRelations) == 1 && /* not partitioned */
-		linitial_int(queryDesc->plannedstmt->resultRelations) == 1 /* target first in range table */
-		)
-	{
-		RangeTblEntry *rte;
-
-		rte = linitial(queryDesc->plannedstmt->rtable);
-		/*
-		 * if the delete command we just ran had no qualifiers and
-		 * was against a simple table, it is nice to be able to
-		 * substitute a truncate-command.
-		 */
-		if (queryDesc->plannedstmt->planTree->qual == NULL &&
-			queryDesc->plannedstmt->planTree->lefttree == NULL &&
-			queryDesc->plannedstmt->planTree->righttree == NULL)
-		{
-			Relation truncRel;
-
-			/*
-			 * acquire the lock required by Truncate.
-			 *
-			 * We only want to set the truncOid if we think the
-			 * truncate will not return an error (we have to be
-			 * the owner of the table, for instance).
-			 */
-			truncRel = heap_open(rte->relid, AccessExclusiveLock);
-			do
-			{
-				if (truncRel->rd_rel->relkind != RELKIND_RELATION ||
-					!pg_class_ownercheck(RelationGetRelid(truncRel), GetUserId()) ||
-					(!allowSystemTableModsDDL && IsSystemRelation(truncRel)))
-				{
-					heap_close(truncRel, AccessExclusiveLock);
-					break;
-				}
-
-				truncOid = rte->relid;
-				heap_close(truncRel, NoLock);
-			} while (0);
-		}
-	}
-
 	autostats_get_cmdtype(queryDesc, &cmdType, &relationOid);
 
 	/*
@@ -1478,22 +1416,6 @@ PortalRunUtility(Portal portal, Node *utilityStmt, bool isTopLevel,
 		ActiveSnapshot = CopySnapshot(GetTransactionSnapshot());
 	else
 		ActiveSnapshot = NULL;
-	gpmon_packet_t *gpmon_pkt = NULL;
-	if(gp_enable_gpperfmon && Gp_role == GP_ROLE_DISPATCH)
-	{
-		gpmon_pkt = (gpmon_packet_t *) palloc0(sizeof(gpmon_packet_t));
-		gpmon_qlog_packet_init(gpmon_pkt);
-		/* set gpmon_pkt->u.qlog.key.ccnt to 0 in utility mode becasue the gp_command_count is changing */
-		gpmon_pkt->u.qlog.key.ccnt = 0;
-		gpmon_qlog_query_submit(gpmon_pkt);
-		gpmon_qlog_query_text(gpmon_pkt,
-				portal->sourceText ? portal->sourceText: "(Source text for portal is not available)",
-				application_name,
-				GetResqueueName(portal->queueId),
-				GetResqueuePriority(portal->queueId));
-				gpmon_qlog_query_start(gpmon_pkt);
-	}
-
 
 	/* check if this utility statement need to be involved into resoure queue
 	 * mgmt */
@@ -1512,12 +1434,6 @@ PortalRunUtility(Portal portal, Node *utilityStmt, bool isTopLevel,
 	if (ActiveSnapshot)
 		FreeSnapshot(ActiveSnapshot);
 	ActiveSnapshot = NULL;
-
-	if(gp_enable_gpperfmon && Gp_role == GP_ROLE_DISPATCH)
-	{
-		gpmon_qlog_query_end(gpmon_pkt);
-		pfree(gpmon_pkt);
-	}
 }
 
 /*

@@ -145,13 +145,7 @@ ProcArrayAdd(PGPROC *proc)
 
 	LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
-#ifdef FAULT_INJECTOR
-	FaultInjector_InjectFaultIfSet(
-		ProcArray_Add,
-		DDLNotSpecified,
-		"", // databaseName
-		""); // tableName
-#endif
+	SIMPLE_FAULT_INJECTOR(ProcArray_Add);
 
 	if (arrayP->numProcs >= arrayP->maxProcs)
 	{
@@ -183,7 +177,7 @@ ProcArrayAdd(PGPROC *proc)
  * twophase.c depends on the latter.)
  */
 void
-ProcArrayRemove(PGPROC *proc, TransactionId latestXid, bool forPrepare, bool isCommit)
+ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 {
 	ProcArrayStruct *arrayP = procArray;
 	int			index;
@@ -218,19 +212,6 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid, bool forPrepare, bool isC
 			arrayP->procs[index] = arrayP->procs[arrayP->numProcs - 1];
 			arrayP->procs[arrayP->numProcs - 1] = NULL; /* for debugging */
 			arrayP->numProcs--;
-
-			if (forPrepare)
-			{
-				LocalDistribXact_ChangeStateUnderLock(
-												proc->xid,
-												&proc->localDistribXactRef,
-												(isCommit ?
-													LOCALDISTRIBXACT_STATE_COMMITPREPARED:
-													LOCALDISTRIBXACT_STATE_ABORTPREPARED));
-
-				LocalDistribXactRef_ReleaseUnderLock(
-												&proc->localDistribXactRef);
-			}
 			LWLockRelease(ProcArrayLock);
 			return;
 		}
@@ -264,8 +245,7 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid, bool forPrepare, bool isC
 void
 ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid, bool isCommit,
 						bool *needStateChangeFromDistributed,
-						bool *needNotifyCommittedDtxTransaction,
-						LocalDistribXactRef *localDistribXactRef)
+						bool *needNotifyCommittedDtxTransaction)
 {
 	if (needStateChangeFromDistributed)
 		*needStateChangeFromDistributed = false;
@@ -285,14 +265,12 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid, bool isCommit,
 
 		LWLockAcquire(ProcArrayLock, LW_EXCLUSIVE);
 
-		if (!LocalDistribXactRef_IsNil(&MyProc->localDistribXactRef))
+		if (MyProc->localDistribXactData.state != LOCALDISTRIBXACT_STATE_NONE)
 		{
 			switch (DistributedTransactionContext)
 			{
 				case DTX_CONTEXT_QD_DISTRIBUTED_CAPABLE:
-					LocalDistribXact_ChangeStateUnderLock(
-						MyProc->xid,
-						&MyProc->localDistribXactRef,
+					LocalDistribXact_ChangeState(MyProc,
 						isCommit ? 
 							LOCALDISTRIBXACT_STATE_COMMITDELIVERY :
 							LOCALDISTRIBXACT_STATE_ABORTDELIVERY);
@@ -303,9 +281,7 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid, bool isCommit,
 				case DTX_CONTEXT_QE_TWO_PHASE_EXPLICIT_WRITER:
 				case DTX_CONTEXT_QE_TWO_PHASE_IMPLICIT_WRITER:
 				case DTX_CONTEXT_QE_AUTO_COMMIT_IMPLICIT:
-					LocalDistribXact_ChangeStateUnderLock(
-						MyProc->xid,
-						&MyProc->localDistribXactRef,
+					LocalDistribXact_ChangeState(MyProc,
 						isCommit ?
 							LOCALDISTRIBXACT_STATE_COMMITTED :
 							LOCALDISTRIBXACT_STATE_ABORTED);
@@ -326,13 +302,6 @@ ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid, bool isCommit,
 					elog(PANIC, "Unrecognized DTX transaction context: %d",
 						 (int) DistributedTransactionContext);
 			}
-
-			/*
-			 * We need to transfer the disributed ref for processing in the caller.
-			 */
-			LocalDistribXactRef_Transfer(
-				localDistribXactRef,
-				&MyProc->localDistribXactRef);
 		}
 
 		if (isCommit && notifyCommittedDtxTransactionIsNeeded())
@@ -413,6 +382,8 @@ ProcArrayClearTransaction(PGPROC *proc)
 	proc->xid = InvalidTransactionId;
 	proc->lxid = InvalidLocalTransactionId;
 	proc->xmin = InvalidTransactionId;
+
+	proc->localDistribXactData.state = LOCALDISTRIBXACT_STATE_NONE;
 
 	/* redundant, but just in case */
 	proc->vacuumFlags &= ~PROC_VACUUM_STATE_MASK;

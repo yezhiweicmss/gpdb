@@ -1541,8 +1541,6 @@ typedef struct SequenceState
 	PlanState **subplans;
 	int			numSubplans;
 
-	PartitionSelectorState *static_selector;
-
 	/*
 	 * True if no subplan has been executed.
 	 */
@@ -1609,7 +1607,10 @@ typedef enum
 
 /*
  * TableType
- *   Enum for different types of tables.
+ *   Enum for different types of tables. The code relies on the enum being
+ *   unsigned so the minimum member value should be zero. Reordering and/or
+ *   renumbering the enum will most likely break assumptions and should be
+ *   refrained from.
  */
 typedef enum
 {
@@ -2702,7 +2703,6 @@ extern void initGpmonPktForMotion(Plan *planNode, gpmon_packet_t *gpmon_pkt, ESt
 extern void initGpmonPktForShareInputScan(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForWindow(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForRepeat(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
-extern void initGpmonPktForDefunctOperators(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForDML(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 extern void initGpmonPktForPartitionSelector(Plan *planNode, gpmon_packet_t *gpmon_pkt, EState *estate);
 

@@ -18,13 +18,37 @@
 
 #include "llvm/IR/Value.h"
 
-#include "codegen/utils/codegen_utils.h"
+#include "codegen/utils/gp_codegen_utils.h"
 
 namespace gpcodegen {
 
 /** \addtogroup gpcodegen
  *  @{
  */
+
+/**
+ * @brief Object that holds the information needed for generating the builtin
+ *        postgres functions.
+ *
+ **/
+struct PGFuncGeneratorInfo {
+  // Convenience members for code generation
+  llvm::Function* llvm_main_func;
+  llvm::BasicBlock* llvm_error_block;
+
+  // llvm arguments for the function.
+  // This can be updated while generating the code.
+  std::vector<llvm::Value*> llvm_args;
+
+  PGFuncGeneratorInfo(
+    llvm::Function* llvm_main_func,
+    llvm::BasicBlock* llvm_error_block,
+    const std::vector<llvm::Value*>& llvm_args) :
+      llvm_main_func(llvm_main_func),
+      llvm_error_block(llvm_error_block),
+      llvm_args(llvm_args) {
+  }
+};
 
 /**
  * @brief Interface for all code generators.
@@ -54,10 +78,8 @@ class PGFuncGeneratorInterface {
    *
    * @return true when it generated successfully otherwise it return false.
    **/
-  virtual bool GenerateCode(gpcodegen::CodegenUtils* codegen_utils,
-                            llvm::Function* llvm_main_func,
-                            llvm::BasicBlock* llvm_error_block,
-                            const std::vector<llvm::Value*>& llvm_args,
+  virtual bool GenerateCode(gpcodegen::GpCodegenUtils* codegen_utils,
+                            const PGFuncGeneratorInfo& pg_gen_info,
                             llvm::Value** llvm_out_value) = 0;
 };
 

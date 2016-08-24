@@ -19,6 +19,7 @@
 #include "s3interface.h"
 using std::stringstream;
 
+// use destructor ~XMLContextHolder() to do the cleanup
 class XMLContextHolder {
    public:
     XMLContextHolder(xmlParserCtxtPtr ctx) : context(ctx) {
@@ -34,7 +35,7 @@ class XMLContextHolder {
     xmlParserCtxtPtr context;
 };
 
-S3Service::S3Service() : service(NULL) {
+S3Service::S3Service() : restfulService(NULL) {
     xmlInitParser();
 }
 
@@ -42,6 +43,81 @@ S3Service::~S3Service() {
     // Cleanup function for the XML library.
     xmlCleanupParser();
 }
+
+Response S3Service::getResponseWithRetries(const string &url, HTTPHeaders &headers,
+                                           const map<string, string> &params, uint64_t retries) {
+    while (retries--) {
+        // declare response here to leverage RVO (Return Value Optimization)
+        Response response = this->restfulService->get(url, headers, params);
+        if (response.isSuccess() || (retries == 0)) {
+            return response;
+        };
+
+        S3WARN("Failed to get a good response in GET from '%s', retrying ...", url.c_str());
+    };
+
+    // an empty response(default status is RESPONSE_FAIL) returned if retries is 0
+    return Response();
+};
+
+Response S3Service::putResponseWithRetries(const string &url, HTTPHeaders &headers,
+                                           const map<string, string> &params, vector<uint8_t> &data,
+                                           uint64_t retries) {
+    while (retries--) {
+        // declare response here to leverage RVO (Return Value Optimization)
+        Response response = this->restfulService->put(url, headers, params, data);
+        if (response.isSuccess() || (retries == 0)) {
+            return response;
+        };
+
+        S3WARN("Failed to get a good response in PUT from '%s', retrying ...", url.c_str());
+    };
+
+    // an empty response(default status is RESPONSE_FAIL) returned if retries is 0
+    return Response();
+};
+
+Response S3Service::postResponseWithRetries(const string &url, HTTPHeaders &headers,
+                                            const map<string, string> &params,
+                                            const vector<uint8_t> &data, uint64_t retries) {
+    while (retries--) {
+        // declare response here to leverage RVO (Return Value Optimization)
+        Response response = this->restfulService->post(url, headers, params, data);
+        if (response.isSuccess() || (retries == 0)) {
+            return response;
+        };
+
+        S3WARN("Failed to get a good response in POST from '%s', retrying ...", url.c_str());
+    };
+
+    // an empty response(default status is RESPONSE_FAIL) returned if retries is 0
+    return Response();
+}
+
+bool S3Service::isKeyExisted(ResponseCode code) {
+    return isSuccessfulResponse(code);
+}
+
+bool S3Service::isHeadResponseCodeNeedRetry(ResponseCode code) {
+    return code == HeadResponseFail;
+}
+
+ResponseCode S3Service::headResponseWithRetries(const string &url, HTTPHeaders &headers,
+                                                const map<string, string> &params,
+                                                uint64_t retries) {
+    ResponseCode response = HeadResponseFail;
+
+    while (retries--) {
+        response = this->restfulService->head(url, headers, params);
+        if (!isHeadResponseCodeNeedRetry(response) || (retries == 0)) {
+            return response;
+        };
+
+        S3WARN("Failed to get a good response in PUT from '%s', retrying ...", url.c_str());
+    };
+
+    return response;
+};
 
 // S3 requires query parameters specified alphabetically.
 string S3Service::getUrl(const string &prefix, const string &schema, const string &host,
@@ -68,9 +144,11 @@ HTTPHeaders S3Service::composeHTTPHeaders(const string &url, const string &marke
 
     HTTPHeaders header;
     header.Add(HOST, host.str());
-    UrlParser p(url.c_str());
     header.Add(X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD");
-    std::stringstream query;
+
+    UrlParser p(url);
+
+    stringstream query;
     if (!marker.empty()) {
         query << "marker=" << marker;
         if (!prefix.empty()) {
@@ -81,12 +159,12 @@ HTTPHeaders S3Service::composeHTTPHeaders(const string &url, const string &marke
         query << "prefix=" << prefix;
     }
 
-    SignRequestV4("GET", &header, region, p.Path(), query.str(), cred);
+    SignRequestV4("GET", &header, region, p.getPath(), query.str(), cred);
 
     return header;
 }
 
-xmlParserCtxtPtr S3Service::getXMLContext(Response response) {
+xmlParserCtxtPtr S3Service::getXMLContext(Response &response) {
     xmlParserCtxtPtr xmlptr =
         xmlCreatePushParserCtxt(NULL, NULL, (const char *)(response.getRawData().data()),
                                 response.getRawData().size(), "resp.xml");
@@ -105,34 +183,38 @@ Response S3Service::getBucketResponse(const string &region, const string &url, c
     HTTPHeaders header = composeHTTPHeaders(url, marker, prefix, region, cred);
     std::map<string, string> empty;
 
-    return service->get(url, header, empty);
+    return this->getResponseWithRetries(url, header, empty);
 }
 
 // parseXMLMessage must not throw exception, otherwise result is leaked.
-void S3Service::parseXMLMessage(xmlParserCtxtPtr xmlcontext) {
+string S3Service::parseXMLMessage(xmlParserCtxtPtr xmlcontext, const string &tag) {
+    string returnMessage;
+
     if (xmlcontext == NULL) {
-        return;
+        return returnMessage;
     }
 
     xmlNode *rootElement = xmlDocGetRootElement(xmlcontext->myDoc);
     if (rootElement == NULL) {
         S3ERROR("Failed to parse returned xml of bucket list");
-        return;
+        return returnMessage;
     }
 
     xmlNodePtr curNode = rootElement->xmlChildrenNode;
     while (curNode != NULL) {
-        if (xmlStrcmp(curNode->name, (const xmlChar *)"Message") == 0) {
+        if (xmlStrcmp(curNode->name, (const xmlChar *)tag.c_str()) == 0) {
             char *content = (char *)xmlNodeGetContent(curNode);
             if (content != NULL) {
-                S3ERROR("Amazon S3 returns error \"%s\"", content);
+                returnMessage = content;
                 xmlFree(content);
             }
-            return;
+            return returnMessage;
         }
 
         curNode = curNode->next;
     }
+
+    return returnMessage;
 }
 
 // parseBucketXML must not throw exception, otherwise result is leaked.
@@ -269,7 +351,8 @@ ListBucketResult *S3Service::listBucket(const string &schema, const string &regi
                 continue;
             }
         } else {
-            parseXMLMessage(xmlContext);
+            S3ERROR("Amazon S3 returns error \"%s\"",
+                    parseXMLMessage(xmlContext, "Message").c_str());
         }
 
         delete result;
@@ -279,70 +362,68 @@ ListBucketResult *S3Service::listBucket(const string &schema, const string &regi
     return result;
 }
 
-uint64_t S3Service::fetchData(uint64_t offset, char *data, uint64_t len, const string &sourceUrl,
-                              const string &region, const S3Credential &cred) {
-    CHECK_OR_DIE(data != NULL);
-
+uint64_t S3Service::fetchData(uint64_t offset, vector<uint8_t> &data, uint64_t len,
+                              const string &sourceUrl, const string &region,
+                              const S3Credential &cred) {
     HTTPHeaders headers;
     map<string, string> params;
-    UrlParser parser(sourceUrl.c_str());
+    UrlParser parser(sourceUrl);
 
-    char rangeBuf[128] = {0};
-    snprintf(rangeBuf, 128, "bytes=%" PRIu64 "-%" PRIu64, offset, offset + len - 1);
-    headers.Add(HOST, parser.Host());
+    char rangeBuf[S3_RANGE_HEADER_STRING_LEN] = {0};
+    snprintf(rangeBuf, sizeof(rangeBuf), "bytes=%" PRIu64 "-%" PRIu64, offset, offset + len - 1);
+    headers.Add(HOST, parser.getHost());
     headers.Add(RANGE, rangeBuf);
     headers.Add(X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD");
 
-    SignRequestV4("GET", &headers, region, parser.Path(), "", cred);
+    SignRequestV4("GET", &headers, region, parser.getPath(), "", cred);
 
-    Response resp = service->get(sourceUrl, headers, params);
+    Response resp = this->getResponseWithRetries(sourceUrl, headers, params);
     if (resp.getStatus() == RESPONSE_OK) {
-        vector<uint8_t> &responseData = resp.getRawData();
-        if (responseData.size() != len) {
+        data = resp.moveDataBuffer();
+        if (data.size() != len) {
             S3ERROR("%s", "Response is not fully received.");
-            return 0;
+            CHECK_OR_DIE_MSG(false, "%s", "Response is not fully received.");
         }
 
-        std::copy(responseData.begin(), responseData.end(), data);
-        return responseData.size();
+        return data.size();
     } else if (resp.getStatus() == RESPONSE_ERROR) {
         xmlParserCtxtPtr xmlContext = getXMLContext(resp);
         if (xmlContext != NULL) {
             XMLContextHolder holder(xmlContext);
-            parseXMLMessage(xmlContext);
+            S3ERROR("Amazon S3 returns error \"%s\"",
+                    parseXMLMessage(xmlContext, "Message").c_str());
         }
 
-        S3ERROR("Failed to fetch: %s, Response message: %s", sourceUrl.c_str(),
+        S3ERROR("Failed to request: %s, Response message: %s", sourceUrl.c_str(),
                 resp.getMessage().c_str());
-        CHECK_OR_DIE_MSG(false, "Failed to fetch: %s, Response message: %s", sourceUrl.c_str(),
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", sourceUrl.c_str(),
                          resp.getMessage().c_str());
-
-        return 0;
     } else {
-        S3ERROR("Failed to fetch: %s, Response message: %s", sourceUrl.c_str(),
+        S3ERROR("Failed to request: %s, Response message: %s", sourceUrl.c_str(),
                 resp.getMessage().c_str());
-        CHECK_OR_DIE_MSG(false, "Failed to fetch: %s, Response message: %s", sourceUrl.c_str(),
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", sourceUrl.c_str(),
                          resp.getMessage().c_str());
-        return 0;
     }
+
+    return 0;
 }
 
 S3CompressionType S3Service::checkCompressionType(const string &keyUrl, const string &region,
                                                   const S3Credential &cred) {
     HTTPHeaders headers;
     map<string, string> params;
-    UrlParser parser(keyUrl.c_str());
+    UrlParser parser(keyUrl);
 
-    char rangeBuf[128] = {0};
-    snprintf(rangeBuf, 128, "bytes=%d-%d", 0, S3_MAGIC_BYTES_NUM - 1);
+    char rangeBuf[S3_RANGE_HEADER_STRING_LEN] = {0};
+    snprintf(rangeBuf, sizeof(rangeBuf), "bytes=%d-%d", 0, S3_MAGIC_BYTES_NUM - 1);
 
-    headers.Add(HOST, parser.Host());
+    headers.Add(HOST, parser.getHost());
     headers.Add(RANGE, rangeBuf);
     headers.Add(X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD");
 
-    SignRequestV4("GET", &headers, region, parser.Path(), "", cred);
+    SignRequestV4("GET", &headers, region, parser.getPath(), "", cred);
 
-    Response resp = service->get(keyUrl, headers, params);
+    Response resp = this->getResponseWithRetries(keyUrl, headers, params);
     if (resp.getStatus() == RESPONSE_OK) {
         vector<uint8_t> &responseData = resp.getRawData();
         if (responseData.size() < S3_MAGIC_BYTES_NUM) {
@@ -360,14 +441,192 @@ S3CompressionType S3Service::checkCompressionType(const string &keyUrl, const st
             xmlParserCtxtPtr xmlContext = getXMLContext(resp);
             if (xmlContext != NULL) {
                 XMLContextHolder holder(xmlContext);
-                parseXMLMessage(xmlContext);
+                S3ERROR("Amazon S3 returns error \"%s\"",
+                        parseXMLMessage(xmlContext, "Message").c_str());
             }
         }
-        CHECK_OR_DIE_MSG(false, "Failed to fetch: %s, Response message: %s", keyUrl.c_str(),
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", keyUrl.c_str(),
                          resp.getMessage().c_str());
     }
 
     return S3_COMPRESSION_PLAIN;
+}
+
+bool S3Service::checkKeyExistence(const string &keyUrl, const string &region,
+                                  const S3Credential &cred) {
+    HTTPHeaders headers;
+    map<string, string> params;
+    UrlParser parser(keyUrl);
+
+    headers.Add(HOST, parser.getHost());
+    headers.Add(X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD");
+
+    SignRequestV4("HEAD", &headers, region, parser.getPath(), "", cred);
+
+    return isKeyExisted(headResponseWithRetries(keyUrl, headers, params));
+}
+
+string S3Service::getUploadId(const string &keyUrl, const string &region,
+                              const S3Credential &cred) {
+    HTTPHeaders headers;
+    map<string, string> params;
+    UrlParser parser(keyUrl);
+
+    headers.Add(HOST, parser.getHost());
+    headers.Disable(CONTENTTYPE);
+    headers.Disable(CONTENTLENGTH);
+    headers.Add(X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD");
+
+    SignRequestV4("POST", &headers, region, parser.getPath(), "uploads=", cred);
+
+    stringstream urlWithQuery;
+    urlWithQuery << keyUrl << "?uploads";
+
+    Response resp =
+        this->postResponseWithRetries(urlWithQuery.str(), headers, params, vector<uint8_t>());
+    if (resp.getStatus() == RESPONSE_OK) {
+        xmlParserCtxtPtr xmlContext = getXMLContext(resp);
+        if (xmlContext != NULL) {
+            XMLContextHolder holder(xmlContext);
+            return parseXMLMessage(xmlContext, "UploadId");
+        }
+    } else if (resp.getStatus() == RESPONSE_ERROR) {
+        xmlParserCtxtPtr xmlContext = getXMLContext(resp);
+        if (xmlContext != NULL) {
+            XMLContextHolder holder(xmlContext);
+            S3ERROR("Amazon S3 returns error \"%s\"",
+                    parseXMLMessage(xmlContext, "Message").c_str());
+        }
+
+        S3ERROR("Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                resp.getMessage().c_str());
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                         resp.getMessage().c_str());
+    } else {
+        S3ERROR("Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                resp.getMessage().c_str());
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                         resp.getMessage().c_str());
+    }
+
+    return "";
+}
+
+string S3Service::uploadPartOfData(vector<uint8_t> &data, const string &keyUrl,
+                                   const string &region, const S3Credential &cred,
+                                   uint64_t partNumber, const string &uploadId) {
+    HTTPHeaders headers;
+    map<string, string> params;
+    UrlParser parser(keyUrl);
+    stringstream queryString;
+
+    headers.Add(HOST, parser.getHost());
+    headers.Add(X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD");
+
+    headers.Add(CONTENTTYPE, "text/plain");
+    headers.Add(CONTENTLENGTH, std::to_string((unsigned long long)data.size()));
+
+    queryString << "partNumber=" << partNumber << "&uploadId=" << uploadId;
+
+    SignRequestV4("PUT", &headers, region, parser.getPath(), queryString.str(), cred);
+
+    stringstream urlWithQuery;
+    urlWithQuery << keyUrl << "?partNumber=" << partNumber << "&uploadId=" << uploadId;
+
+    Response resp = this->putResponseWithRetries(urlWithQuery.str(), headers, params, data);
+    if (resp.getStatus() == RESPONSE_OK) {
+        string headers(resp.getRawHeaders().begin(), resp.getRawHeaders().end());
+
+        uint64_t etagStartPos = headers.find("ETag: ") + 6;
+        string etagToEnd = headers.substr(etagStartPos);
+        // RFC 2616 states "HTTP/1.1 defines the sequence CR LF as the end-of-line
+        // marker for all protocol elements except the entity-body"
+        uint64_t etagStrLen = etagToEnd.find("\r");
+
+        return etagToEnd.substr(0, etagStrLen);
+    } else if (resp.getStatus() == RESPONSE_ERROR) {
+        xmlParserCtxtPtr xmlContext = getXMLContext(resp);
+        if (xmlContext != NULL) {
+            XMLContextHolder holder(xmlContext);
+            S3ERROR("Amazon S3 returns error \"%s\"",
+                    parseXMLMessage(xmlContext, "Message").c_str());
+        }
+
+        S3ERROR("Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                resp.getMessage().c_str());
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                         resp.getMessage().c_str());
+    } else {
+        S3ERROR("Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                resp.getMessage().c_str());
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                         resp.getMessage().c_str());
+    }
+
+    return "";
+}
+
+bool S3Service::completeMultiPart(const string &keyUrl, const string &region,
+                                  const S3Credential &cred, const string &uploadId,
+                                  const vector<string> &etagArray) {
+    HTTPHeaders headers;
+    map<string, string> params;
+    UrlParser parser(keyUrl);
+    stringstream queryString;
+
+    stringstream body;
+
+    // check whether etagList or uploadId are empty,
+    // no matter we have done this in upper-layer or not.
+    if (etagArray.empty() || uploadId.empty()) {
+        return false;
+    }
+
+    body << "<CompleteMultipartUpload>\n";
+    for (uint64_t i = 0; i < etagArray.size(); ++i) {
+        body << "  <Part>\n    <PartNumber>" << i + 1 << "</PartNumber>\n    <ETag>" << etagArray[i]
+             << "</ETag>\n  </Part>\n";
+    }
+    body << "</CompleteMultipartUpload>";
+
+    headers.Add(HOST, parser.getHost());
+    headers.Add(CONTENTTYPE, "application/xml");
+    headers.Add(X_AMZ_CONTENT_SHA256, "UNSIGNED-PAYLOAD");
+    headers.Add(CONTENTLENGTH, std::to_string((unsigned long long)body.str().length()));
+
+    queryString << "uploadId=" << uploadId;
+
+    SignRequestV4("POST", &headers, region, parser.getPath(), queryString.str(), cred);
+
+    stringstream urlWithQuery;
+    urlWithQuery << keyUrl << "?uploadId=" << uploadId;
+
+    string bodyString = body.str();
+    Response resp = this->postResponseWithRetries(
+        urlWithQuery.str(), headers, params, vector<uint8_t>(bodyString.begin(), bodyString.end()));
+
+    if (resp.getStatus() == RESPONSE_OK) {
+        return true;
+    } else if (resp.getStatus() == RESPONSE_ERROR) {
+        xmlParserCtxtPtr xmlContext = getXMLContext(resp);
+        if (xmlContext != NULL) {
+            XMLContextHolder holder(xmlContext);
+            S3ERROR("Amazon S3 returns error \"%s\"",
+                    parseXMLMessage(xmlContext, "Message").c_str());
+        }
+
+        S3ERROR("Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                resp.getMessage().c_str());
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                         resp.getMessage().c_str());
+    } else {
+        S3ERROR("Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                resp.getMessage().c_str());
+        CHECK_OR_DIE_MSG(false, "Failed to request: %s, Response message: %s", keyUrl.c_str(),
+                         resp.getMessage().c_str());
+    }
+
+    return false;
 }
 
 ListBucketResult::~ListBucketResult() {

@@ -4,8 +4,8 @@
 #include <zlib.h>
 #include "reader.h"
 
-// 256K by default
-extern unsigned int S3_ZIP_CHUNKSIZE;
+// 2MB by default
+extern uint64_t S3_ZIP_CHUNKSIZE;
 
 class DecompressReader : public Reader {
    public:
@@ -14,8 +14,7 @@ class DecompressReader : public Reader {
 
     void open(const ReaderParams &params);
 
-    // read() attempts to read up to count bytes into the buffer starting at
-    // buffer.
+    // read() attempts to read up to count bytes into the buffer.
     // Return 0 if EOF. Throw exception if encounters errors.
     uint64_t read(char *buf, uint64_t count);
 
@@ -24,7 +23,7 @@ class DecompressReader : public Reader {
 
     void setReader(Reader *reader);
 
-    void resizeDecompressReaderBuffer(int size);
+    void resizeDecompressReaderBuffer(uint64_t size);
 
    private:
     void decompress();

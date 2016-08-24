@@ -10,21 +10,41 @@
 //
 //---------------------------------------------------------------------------
 
+#include <assert.h>
+#include <cstdint>
+#include <memory>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
 #include "codegen/expr_tree_generator.h"
 #include "codegen/op_expr_tree_generator.h"
+#include "codegen/pg_func_generator.h"
+#include "codegen/pg_func_generator_interface.h"
+#include "codegen/utils/gp_codegen_utils.h"
+#include "codegen/pg_arith_func_generator.h"
+#include "codegen/pg_date_func_generator.h"
 
-#include "include/codegen/pg_arith_func_generator.h"
-#include "llvm/IR/Value.h"
+#include "llvm/IR/IRBuilder.h"
 
 extern "C" {
 #include "postgres.h"  // NOLINT(build/include)
-#include "utils/elog.h"
+#include "c.h"  // NOLINT(build/include)
 #include "nodes/execnodes.h"
+#include "utils/elog.h"
+#include "nodes/nodes.h"
+#include "nodes/pg_list.h"
+#include "nodes/primnodes.h"
 }
+
+namespace llvm {
+class Value;
+}  // namespace llvm
 
 using gpcodegen::OpExprTreeGenerator;
 using gpcodegen::ExprTreeGenerator;
-using gpcodegen::CodegenUtils;
+using gpcodegen::GpCodegenUtils;
 using gpcodegen::PGFuncGeneratorInterface;
 using gpcodegen::PGFuncGenerator;
 using gpcodegen::CodeGenFuncMap;
@@ -36,13 +56,15 @@ OpExprTreeGenerator::supported_function_;
 void OpExprTreeGenerator::InitializeSupportedFunction() {
   if (!supported_function_.empty()) { return; }
 
+  supported_function_[141] = std::unique_ptr<PGFuncGeneratorInterface>(
+      new PGGenericFuncGenerator<int32_t, int32_t>(
+          141,
+          "int4mul",
+          &PGArithFuncGenerator<int32_t, int32_t, int32_t>::MulWithOverflow));
+
   supported_function_[149] = std::unique_ptr<PGFuncGeneratorInterface>(
       new PGIRBuilderFuncGenerator<decltype(&IRBuilder<>::CreateICmpSLE),
       int32_t, int32_t>(149, "int4le", &IRBuilder<>::CreateICmpSLE));
-
-  supported_function_[1088] = std::unique_ptr<PGFuncGeneratorInterface>(
-      new PGIRBuilderFuncGenerator<decltype(&IRBuilder<>::CreateICmpSLE),
-      int32_t, int32_t>(1088, "date_le", &IRBuilder<>::CreateICmpSLE));
 
   supported_function_[177] = std::unique_ptr<PGFuncGeneratorInterface>(
       new PGGenericFuncGenerator<int32_t, int32_t>(
@@ -56,15 +78,37 @@ void OpExprTreeGenerator::InitializeSupportedFunction() {
           "int4mi",
           &PGArithFuncGenerator<int32_t, int32_t, int32_t>::SubWithOverflow));
 
-  supported_function_[141] = std::unique_ptr<PGFuncGeneratorInterface>(
-      new PGGenericFuncGenerator<int32_t, int32_t>(
-          141,
-          "int4mul",
-          &PGArithFuncGenerator<int32_t, int32_t, int32_t>::MulWithOverflow));
+  supported_function_[216] = std::unique_ptr<PGFuncGeneratorInterface>(
+      new PGGenericFuncGenerator<float8, float8>(
+          216,
+          "float8mul",
+          &PGArithFuncGenerator<float8, float8, float8>::MulWithOverflow));
+
+  supported_function_[218] = std::unique_ptr<PGFuncGeneratorInterface>(
+      new PGGenericFuncGenerator<float8, float8>(
+          218,
+          "float8pl",
+          &PGArithFuncGenerator<float8, float8, float8>::AddWithOverflow));
+
+  supported_function_[219] = std::unique_ptr<PGFuncGeneratorInterface>(
+      new PGGenericFuncGenerator<float8, float8>(
+          219,
+          "float8mi",
+          &PGArithFuncGenerator<float8, float8, float8>::SubWithOverflow));
+
+  supported_function_[1088] = std::unique_ptr<PGFuncGeneratorInterface>(
+      new PGIRBuilderFuncGenerator<decltype(&IRBuilder<>::CreateICmpSLE),
+      int32_t, int32_t>(1088, "date_le", &IRBuilder<>::CreateICmpSLE));
+
+  supported_function_[2339] = std::unique_ptr<PGFuncGeneratorInterface>(
+      new PGGenericFuncGenerator<int32_t, int64_t>(
+          2339,
+          "date_le_timestamp",
+          &PGDateFuncGenerator::DateLETimestamp));
 }
 
 OpExprTreeGenerator::OpExprTreeGenerator(
-    ExprState* expr_state,
+    const ExprState* expr_state,
     std::vector<
         std::unique_ptr<ExprTreeGenerator>>&& arguments)  // NOLINT(build/c++11)
     :  ExprTreeGenerator(expr_state, ExprTreeNodeType::kOperator),
@@ -72,8 +116,8 @@ OpExprTreeGenerator::OpExprTreeGenerator(
 }
 
 bool OpExprTreeGenerator::VerifyAndCreateExprTree(
-    ExprState* expr_state,
-    ExprContext* econtext,
+    const ExprState* expr_state,
+    ExprTreeGeneratorInfo* gen_info,
     std::unique_ptr<ExprTreeGenerator>* expr_tree) {
   assert(nullptr != expr_state &&
          nullptr != expr_state->expr &&
@@ -89,10 +133,11 @@ bool OpExprTreeGenerator::VerifyAndCreateExprTree(
     return false;
   }
 
-  List *arguments = reinterpret_cast<FuncExprState*>(expr_state)->args;
+  List *arguments = reinterpret_cast<const FuncExprState*>(expr_state)->args;
   assert(nullptr != arguments);
   // In ExecEvalFuncArgs
-  assert(list_length(arguments) == itr->second->GetTotalArgCount());
+  assert(list_length(arguments) ==
+        static_cast<int>(itr->second->GetTotalArgCount()));
 
   ListCell   *arg = nullptr;
   bool supported_tree = true;
@@ -103,8 +148,8 @@ bool OpExprTreeGenerator::VerifyAndCreateExprTree(
     assert(nullptr != argstate);
     std::unique_ptr<ExprTreeGenerator> arg(nullptr);
     supported_tree &= ExprTreeGenerator::VerifyAndCreateExprTree(argstate,
-                                                                econtext,
-                                                                &arg);
+                                                                 gen_info,
+                                                                 &arg);
     if (!supported_tree) {
       break;
     }
@@ -119,11 +164,9 @@ bool OpExprTreeGenerator::VerifyAndCreateExprTree(
   return true;
 }
 
-bool OpExprTreeGenerator::GenerateCode(CodegenUtils* codegen_utils,
-                                       ExprContext* econtext,
-                                       llvm::Function* llvm_main_func,
-                                       llvm::BasicBlock* llvm_error_block,
-                                       llvm::Value* llvm_isnull_arg,
+bool OpExprTreeGenerator::GenerateCode(GpCodegenUtils* codegen_utils,
+                                       const ExprTreeGeneratorInfo& gen_info,
+                                       llvm::Value* llvm_isnull_ptr,
                                        llvm::Value** llvm_out_value) {
   assert(nullptr != llvm_out_value);
   *llvm_out_value = nullptr;
@@ -137,9 +180,13 @@ bool OpExprTreeGenerator::GenerateCode(CodegenUtils* codegen_utils,
     return false;
   }
 
-  if (arguments_.size() != itr->second->GetTotalArgCount()) {
+  // Get the interface to generate code for operator function
+  PGFuncGeneratorInterface* pg_func_interface = itr->second.get();
+  assert(nullptr != pg_func_interface);
+
+  if (arguments_.size() != pg_func_interface->GetTotalArgCount()) {
     elog(WARNING, "Expected argument size to be %lu\n",
-         itr->second->GetTotalArgCount());
+         pg_func_interface->GetTotalArgCount());
     return false;
   }
   bool arg_generated = true;
@@ -147,19 +194,22 @@ bool OpExprTreeGenerator::GenerateCode(CodegenUtils* codegen_utils,
   for (auto& arg : arguments_) {
     llvm::Value* llvm_arg = nullptr;
     arg_generated &= arg->GenerateCode(codegen_utils,
-                                       econtext,
-                                       llvm_main_func,
-                                       llvm_error_block,
-                                       llvm_isnull_arg,
+                                       gen_info,
+                                       llvm_isnull_ptr,
                                        &llvm_arg);
     if (!arg_generated) {
       return false;
     }
     llvm_arguments.push_back(llvm_arg);
   }
-  return itr->second->GenerateCode(codegen_utils,
-                                   llvm_main_func,
-                                   llvm_error_block,
-                                   llvm_arguments,
-                                   llvm_out_value);
+  llvm::Value* llvm_op_value = nullptr;
+  PGFuncGeneratorInfo pg_func_info(gen_info.llvm_main_func,
+                                   gen_info.llvm_error_block,
+                                   llvm_arguments);
+  bool retval = pg_func_interface->GenerateCode(codegen_utils,
+                                                pg_func_info,
+                                                &llvm_op_value);
+  // convert return type to Datum
+  *llvm_out_value = codegen_utils->CreateCppTypeToDatumCast(llvm_op_value);
+  return retval;
 }

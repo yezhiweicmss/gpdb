@@ -424,7 +424,7 @@ SocketBackend(StringInfo inBuf)
 	qtype = pq_getbyte();
 
 	if (!disable_sig_alarm(false))
-			elog(FATAL, "could not disable timer for client wiat timeout");
+			elog(FATAL, "could not disable timer for client wait timeout");
 
 	if (qtype == EOF)			/* frontend disconnected */
 	{
@@ -616,6 +616,7 @@ prepare_for_client_read(void)
 		/* Enable immediate processing of asynchronous signals */
 		EnableNotifyInterrupt();
 		EnableCatchupInterrupt();
+		EnableClientWaitTimeoutInterrupt();
 
 		/* Allow "die" interrupt to be processed while waiting */
 		ImmediateInterruptOK = true;
@@ -653,6 +654,7 @@ client_read_ended(void)
 
 		DisableNotifyInterrupt();
 		DisableCatchupInterrupt();
+		DisableClientWaitTimeoutInterrupt();
 	}
 	else
 	{
@@ -2200,7 +2202,6 @@ exec_bind_message(StringInfo input_message)
 	Snapshot	mySnapshot = NULL;
 	char		msec_str[32];
 
-
 	/* Get the fixed part of the message */
 	portal_name = pq_getmsgstring(input_message);
 	stmt_name = pq_getmsgstring(input_message);
@@ -2340,15 +2341,7 @@ exec_bind_message(StringInfo input_message)
 	 */
 	if (numParams > 0)
 	{
-		Snapshot        mySnapshot;
 		int			paramno;
-		
-		 /*
-		  * Set a snapshot if we have parameters to fetch (since the input
-		  * functions might need it).
-		  */
-		mySnapshot = CopySnapshot(GetTransactionSnapshot());
-		ActiveSnapshot = mySnapshot;
 
 		/* sizeof(ParamListInfoData) includes the first array element */
 		params = (ParamListInfo) palloc(sizeof(ParamListInfoData) +
@@ -2474,12 +2467,6 @@ exec_bind_message(StringInfo input_message)
 			params->params[paramno].pflags = PARAM_FLAG_CONST;
 			params->params[paramno].ptype = ptype;
 		}
-
-		MemoryContextSwitchTo(oldContext);
-		
-		/* Done with the snapshot used for parameter I/O */
-		ActiveSnapshot = NULL;
-		FreeSnapshot(mySnapshot);
 	}
 	else
 		params = NULL;
@@ -3467,6 +3454,7 @@ die(SIGNAL_ARGS)
 			LockWaitCancel();	/* prevent CheckDeadLock from running */
 			DisableNotifyInterrupt();
 			DisableCatchupInterrupt();
+			DisableClientWaitTimeoutInterrupt();
 			InterruptHoldoffCount--;
 			ProcessInterrupts();
 		}
@@ -3580,8 +3568,6 @@ CdbProgramErrorHandler(SIGNAL_ARGS)
         pts = "Master process";
     else if (Gp_role == GP_ROLE_EXECUTE)
         pts = "Segment process";
-    else if (Gp_role == GP_ROLE_DISPATCHAGENT)
-    	pts = "DA process";
     else
         pts = "Process";
 
@@ -3651,6 +3637,7 @@ ProcessInterrupts(void)
 		ImmediateDieOK = false;		/* prevent re-entry */
 		DisableNotifyInterrupt();
 		DisableCatchupInterrupt();
+		DisableClientWaitTimeoutInterrupt();
 		if (IsAutoVacuumWorkerProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_ADMIN_SHUTDOWN),
@@ -3669,6 +3656,7 @@ ProcessInterrupts(void)
 		ImmediateInterruptOK = false;	/* not idle anymore */
 		DisableNotifyInterrupt();
 		DisableCatchupInterrupt();
+		DisableClientWaitTimeoutInterrupt();
 		/* don't send to client, we already know the connection to be dead. */
 		whereToSendOutput = DestNone;
 		ereport(FATAL,
@@ -4712,6 +4700,7 @@ PostgresMain(int argc, char *argv[],
 		DoingCommandRead = false;
 		DisableNotifyInterrupt();
 		DisableCatchupInterrupt();
+		DisableClientWaitTimeoutInterrupt();
 
 		/* Make sure libpq is in a good state */
 		pq_comm_reset();
@@ -4833,12 +4822,7 @@ PostgresMain(int argc, char *argv[],
 				pgstat_report_activity("<IDLE>");
 			}
 
-			if (Gp_role == GP_ROLE_EXECUTE && Gp_is_writer)
-			{
-				ReadyForQuery_QEWriter(whereToSendOutput);
-			}
-			else
-				ReadyForQuery(whereToSendOutput);
+			ReadyForQuery(whereToSendOutput);
 			send_ready_for_query = false;
 		}
 

@@ -50,6 +50,26 @@ CodeGeneratorManagerDestroy(void* manager)
 	elog(ERROR, "mock implementation of CodeGeneratorManager_Destroy called");
 }
 
+/*
+ * Accumulate the explain string with a dump of all the underlying LLVM modules
+ */
+void
+CodeGeneratorManagerAccumulateExplainString(void* manager)
+{
+	elog(ERROR, "mock implementation of CodeGeneratorManager_AccumulateExplainString called");
+}
+
+/*
+ * Return a copy in CurrentMemoryContext of the previously accumulated explain
+ * string
+ */
+char*
+CodeGeneratorManagerGetExplainString(void* manager)
+{
+	elog(ERROR, "mock implementation of CodeGeneratorManager_GetExplainString called");
+	return NULL;
+}
+
 // get the active code generator manager
 void*
 GetActiveCodeGeneratorManager()
@@ -82,7 +102,8 @@ void*
 ExecEvalExprCodegenEnroll(ExecEvalExprFn regular_func_ptr,
                           ExecEvalExprFn* ptr_to_regular_func_ptr,
                           struct ExprState *exprstate,
-                          struct ExprContext *econtext)
+                          struct ExprContext *econtext,
+                          struct PlanState* planstate)
 {
   *ptr_to_regular_func_ptr = regular_func_ptr;
    elog(ERROR, "mock implementation of ExecEvalExprCodegenEnroll called");

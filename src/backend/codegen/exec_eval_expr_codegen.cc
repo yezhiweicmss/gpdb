@@ -9,56 +9,100 @@
 //    Generates code for ExecEvalExpr function.
 //
 //---------------------------------------------------------------------------
-#include <algorithm>
+#include <assert.h>
+#include <stddef.h>
 #include <cstdint>
+#include <memory>
 #include <string>
 
+#include "codegen/base_codegen.h"
+#include "codegen/codegen_wrapper.h"
 #include "codegen/exec_eval_expr_codegen.h"
 #include "codegen/expr_tree_generator.h"
 #include "codegen/op_expr_tree_generator.h"
-#include "codegen/utils/clang_compiler.h"
+#include "codegen/slot_getattr_codegen.h"
+#include "codegen/utils/gp_codegen_utils.h"
 #include "codegen/utils/utility.h"
-#include "codegen/utils/instance_method_wrappers.h"
-#include "codegen/utils/codegen_utils.h"
 
-#include "llvm/ADT/APFloat.h"
-#include "llvm/ADT/APInt.h"
 #include "llvm/IR/Argument.h"
-#include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constant.h"
-#include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/Function.h"
-#include "llvm/IR/GlobalVariable.h"
-#include "llvm/IR/Instruction.h"
-#include "llvm/IR/Instructions.h"
-#include "llvm/IR/Module.h"
-#include "llvm/IR/Type.h"
-#include "llvm/IR/Value.h"
-#include "llvm/IR/Verifier.h"
-#include "llvm/Support/Casting.h"
+#include "llvm/IR/IRBuilder.h"
+
 
 extern "C" {
 #include "postgres.h"  // NOLINT(build/include)
-#include "utils/elog.h"
 #include "nodes/execnodes.h"
+#include "utils/elog.h"
+#include "executor/tuptable.h"
+#include "nodes/nodes.h"
 }
 
+namespace llvm {
+class BasicBlock;
+class Function;
+class Value;
+}  // namespace llvm
+
 using gpcodegen::ExecEvalExprCodegen;
+using gpcodegen::SlotGetAttrCodegen;
 
 constexpr char ExecEvalExprCodegen::kExecEvalExprPrefix[];
 
-ExecEvalExprCodegen::ExecEvalExprCodegen
-(
+ExecEvalExprCodegen::ExecEvalExprCodegen(
+    CodegenManager* manager,
     ExecEvalExprFn regular_func_ptr,
     ExecEvalExprFn* ptr_to_regular_func_ptr,
     ExprState *exprstate,
-    ExprContext *econtext) :
-    BaseCodegen(kExecEvalExprPrefix,
-                regular_func_ptr, ptr_to_regular_func_ptr),
-                exprstate_(exprstate),
-                econtext_(econtext) {
+    ExprContext *econtext,
+    PlanState* plan_state)
+    : BaseCodegen(manager,
+                  kExecEvalExprPrefix,
+                  regular_func_ptr, ptr_to_regular_func_ptr),
+      exprstate_(exprstate),
+      plan_state_(plan_state),
+      gen_info_(econtext, nullptr, nullptr, nullptr, 0),
+      slot_getattr_codegen_(nullptr),
+      expr_tree_generator_(nullptr) {
 }
 
+bool ExecEvalExprCodegen::InitDependencies() {
+  OpExprTreeGenerator::InitializeSupportedFunction();
+  ExprTreeGenerator::VerifyAndCreateExprTree(
+        exprstate_, &gen_info_, &expr_tree_generator_);
+  // Prepare dependent slot_getattr() generation
+  PrepareSlotGetAttr();
+  return true;
+}
+
+void ExecEvalExprCodegen::PrepareSlotGetAttr() {
+  TupleTableSlot* slot = nullptr;
+  assert(nullptr != plan_state_);
+  switch (nodeTag(plan_state_)) {
+    case T_SeqScanState:
+    case T_TableScanState:
+      // Generate dependent slot_getattr() implementation for the given slot
+      if (gen_info_.max_attr > 0) {
+        slot = reinterpret_cast<ScanState*>(plan_state_)
+            ->ss_ScanTupleSlot;
+        assert(nullptr != slot);
+      }
+      break;
+    case T_AggState:
+      // For now, we assume that tuples for the Aggs are already going to be
+      // deformed in which case, we can avoid generating and calling the
+      // generated slot_getattr(). This may not be true always, but calling the
+      // regular slot_getattr() will still preserve correctness.
+      break;
+    default:
+      elog(DEBUG1,
+          "Attempting to generate ExecEvalExpr for an unsupported operator!");
+  }
+
+  if (nullptr != slot) {
+    slot_getattr_codegen_ = SlotGetAttrCodegen::GetCodegenInstance(
+        manager(), slot, gen_info_.max_attr);
+  }
+}
 
 bool ExecEvalExprCodegen::GenerateExecEvalExpr(
     gpcodegen::GpCodegenUtils* codegen_utils) {
@@ -66,21 +110,31 @@ bool ExecEvalExprCodegen::GenerateExecEvalExpr(
   assert(NULL != codegen_utils);
   if (nullptr == exprstate_ ||
       nullptr == exprstate_->expr ||
-      nullptr == econtext_) {
+      nullptr == gen_info_.econtext) {
     return false;
   }
-  // TODO(krajaraman): move to better place
-  OpExprTreeGenerator::InitializeSupportedFunction();
+
+  if (nullptr == expr_tree_generator_.get()) {
+    return false;
+  }
+
+  // In case the generation above either failed or was not needed,
+  // we revert to use the external slot_getattr()
+  if (nullptr == slot_getattr_codegen_) {
+    gen_info_.llvm_slot_getattr_func =
+        codegen_utils->GetOrRegisterExternalFunction(slot_getattr,
+                                                     "slot_getattr");
+  } else {
+    slot_getattr_codegen_->GenerateCode(codegen_utils);
+    gen_info_.llvm_slot_getattr_func =
+      slot_getattr_codegen_->GetGeneratedFunction();
+  }
 
   llvm::Function* exec_eval_expr_func = CreateFunction<ExecEvalExprFn>(
       codegen_utils, GetUniqueFuncName());
 
   // Function arguments to ExecVariableList
-  llvm::Value* llvm_expression_arg =
-      ArgumentByPosition(exec_eval_expr_func, 0);
-  llvm::Value* llvm_econtext_arg = ArgumentByPosition(exec_eval_expr_func, 1);
   llvm::Value* llvm_isnull_arg = ArgumentByPosition(exec_eval_expr_func, 2);
-  llvm::Value* llvm_isDone_arg = ArgumentByPosition(exec_eval_expr_func, 3);
 
   // BasicBlock of function entry.
   llvm::BasicBlock* llvm_entry_block = codegen_utils->CreateBasicBlock(
@@ -88,29 +142,23 @@ bool ExecEvalExprCodegen::GenerateExecEvalExpr(
   llvm::BasicBlock* llvm_error_block = codegen_utils->CreateBasicBlock(
         "error_block", exec_eval_expr_func);
 
+  gen_info_.llvm_main_func = exec_eval_expr_func;
+  gen_info_.llvm_error_block = llvm_error_block;
+
   auto irb = codegen_utils->ir_builder();
 
   irb->SetInsertPoint(llvm_entry_block);
 
+#ifdef CODEGEN_DEBUG
   codegen_utils->CreateElog(
-        DEBUG1,
-        "Calling codegen'ed expression evaluation");
-
-  // Check if we can codegen. If so create ExprTreeGenerator
-  std::unique_ptr<ExprTreeGenerator> expr_tree_generator(nullptr);
-  bool can_generate = ExprTreeGenerator::VerifyAndCreateExprTree(
-      exprstate_, econtext_, &expr_tree_generator);
-  if (!can_generate ||
-      expr_tree_generator.get() == nullptr) {
-    return false;
-  }
+      DEBUG1,
+      "Codegen'ed expression evaluation called!");
+#endif
 
   // Generate code from expression tree generator
   llvm::Value* value = nullptr;
-  bool is_generated = expr_tree_generator->GenerateCode(codegen_utils,
-                                                        econtext_,
-                                                        exec_eval_expr_func,
-                                                        llvm_error_block,
+  bool is_generated = expr_tree_generator_->GenerateCode(codegen_utils,
+                                                        gen_info_,
                                                         llvm_isnull_arg,
                                                         &value);
   if (!is_generated ||
@@ -118,7 +166,7 @@ bool ExecEvalExprCodegen::GenerateExecEvalExpr(
     return false;
   }
 
-  llvm::Value* llvm_ret_value = codegen_utils->CreateCast<int64_t>(value);
+  llvm::Value* llvm_ret_value = codegen_utils->CreateCppTypeToDatumCast(value);
   irb->CreateRet(llvm_ret_value);
 
   irb->SetInsertPoint(llvm_error_block);

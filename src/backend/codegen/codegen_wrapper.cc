@@ -11,11 +11,21 @@
 //---------------------------------------------------------------------------
 
 #include "codegen/codegen_wrapper.h"
-#include "codegen/codegen_manager.h"
-#include "codegen/exec_variable_list_codegen.h"
-#include "codegen/exec_eval_expr_codegen.h"
 
+#include <assert.h>
+#include <string>
+#include <type_traits>
+
+#include "codegen/base_codegen.h"
+#include "codegen/codegen_manager.h"
+#include "codegen/exec_eval_expr_codegen.h"
+#include "codegen/exec_variable_list_codegen.h"
+#include "codegen/expr_tree_generator.h"
 #include "codegen/utils/gp_codegen_utils.h"
+
+extern "C" {
+#include "lib/stringinfo.h"
+}
 
 using gpcodegen::CodegenManager;
 using gpcodegen::BaseCodegen;
@@ -61,6 +71,25 @@ unsigned int CodeGeneratorManagerNotifyParameterChange(void* manager) {
   return 0;
 }
 
+void CodeGeneratorManagerAccumulateExplainString(void* manager) {
+  if (!codegen) {
+    return;
+  }
+  assert(nullptr != manager);
+  static_cast<CodegenManager*>(manager)->AccumulateExplainString();
+}
+
+char* CodeGeneratorManagerGetExplainString(void* manager) {
+  if (!codegen) {
+    return nullptr;
+  }
+  StringInfo return_string = makeStringInfo();
+  appendStringInfoString(
+      return_string,
+      static_cast<CodegenManager*>(manager)->GetExplainString().c_str());
+  return return_string->data;
+}
+
 void CodeGeneratorManagerDestroy(void* manager) {
   delete (static_cast<CodegenManager*>(manager));
 }
@@ -101,7 +130,10 @@ ClassType* CodegenEnroll(FuncType regular_func_ptr,
     }
 
   ClassType* generator = new ClassType(
-      regular_func_ptr, ptr_to_chosen_func_ptr, std::forward<Args>(args)...);
+      manager,
+      regular_func_ptr,
+      ptr_to_chosen_func_ptr,
+      std::forward<Args>(args)...);
     bool is_enrolled = manager->EnrollCodeGenerator(
         CodegenFuncLifespan_Parameter_Invariant, generator);
     assert(is_enrolled);
@@ -122,9 +154,14 @@ void* ExecEvalExprCodegenEnroll(
     ExecEvalExprFn regular_func_ptr,
     ExecEvalExprFn* ptr_to_chosen_func_ptr,
     ExprState *exprstate,
-    ExprContext *econtext) {
+    ExprContext *econtext,
+    PlanState* plan_state) {
   ExecEvalExprCodegen* generator = CodegenEnroll<ExecEvalExprCodegen>(
-      regular_func_ptr, ptr_to_chosen_func_ptr, exprstate, econtext);
+      regular_func_ptr,
+      ptr_to_chosen_func_ptr,
+      exprstate,
+      econtext,
+      plan_state);
   return generator;
 }
 

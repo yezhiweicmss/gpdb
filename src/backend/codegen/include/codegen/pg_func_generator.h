@@ -17,7 +17,7 @@
 #include <memory>
 
 #include "codegen/pg_func_generator_interface.h"
-#include "codegen/utils/codegen_utils.h"
+#include "codegen/utils/gp_codegen_utils.h"
 
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Value.h"
@@ -28,10 +28,8 @@ namespace gpcodegen {
  *  @{
  */
 
-typedef bool (*PGFuncGenerator)(gpcodegen::CodegenUtils* codegen_utils,
-    llvm::Function* llvm_main_func,
-    llvm::BasicBlock* llvm_error_block,
-    const std::vector<llvm::Value*>& llvm_args,
+typedef bool (*PGFuncGenerator)(gpcodegen::GpCodegenUtils* codegen_utils,
+    const PGFuncGeneratorInfo& pg_func_info,
     llvm::Value** llvm_out_value);
 
 
@@ -63,7 +61,7 @@ class PGFuncBaseGenerator : public PGFuncGeneratorInterface {
    *
    * @return true on successful preprocess otherwise return false.
    **/
-  bool PreProcessArgs(gpcodegen::CodegenUtils* codegen_utils,
+  bool PreProcessArgs(gpcodegen::GpCodegenUtils* codegen_utils,
                       const std::vector<llvm::Value*>& llvm_in_args,
                       std::vector<llvm::Value*>* llvm_out_args) {
     assert(nullptr != codegen_utils &&
@@ -71,8 +69,11 @@ class PGFuncBaseGenerator : public PGFuncGeneratorInterface {
     if (llvm_in_args.size() != GetTotalArgCount()) {
       return false;
     }
-    llvm_out_args->push_back(codegen_utils->CreateCast<Arg0>(llvm_in_args[0]));
-    llvm_out_args->push_back(codegen_utils->CreateCast<Arg1>(llvm_in_args[1]));
+    // Convert Datum to given cpp type.
+    llvm_out_args->push_back(codegen_utils->CreateDatumToCppTypeCast
+                             <Arg0>(llvm_in_args[0]));
+    llvm_out_args->push_back(codegen_utils->CreateDatumToCppTypeCast
+                             <Arg1>(llvm_in_args[1]));
     return true;
   }
 
@@ -132,14 +133,14 @@ Arg0, Arg1> {
                                              mem_func_ptr) {
   }
 
-  bool GenerateCode(gpcodegen::CodegenUtils* codegen_utils,
-                    llvm::Function* llvm_main_func,
-                    llvm::BasicBlock* llvm_error_block,
-                    const std::vector<llvm::Value*>& llvm_args,
+  bool GenerateCode(gpcodegen::GpCodegenUtils* codegen_utils,
+                    const PGFuncGeneratorInfo& pg_func_info,
                     llvm::Value** llvm_out_value) final {
     assert(nullptr != llvm_out_value);
     std::vector<llvm::Value*> llvm_preproc_args;
-    if (!this->PreProcessArgs(codegen_utils, llvm_args, &llvm_preproc_args)) {
+    if (!this->PreProcessArgs(codegen_utils,
+                              pg_func_info.llvm_args,
+                              &llvm_preproc_args)) {
       return false;
     }
     llvm::IRBuilder<>* irb = codegen_utils->ir_builder();
@@ -178,20 +179,22 @@ Arg0, Arg1> {
                                              func_ptr) {
   }
 
-  bool GenerateCode(gpcodegen::CodegenUtils* codegen_utils,
-                    llvm::Function* llvm_main_func,
-                    llvm::BasicBlock* llvm_error_block,
-                    const std::vector<llvm::Value*>& llvm_args,
+  bool GenerateCode(gpcodegen::GpCodegenUtils* codegen_utils,
+                    const PGFuncGeneratorInfo& pg_func_info,
                     llvm::Value** llvm_out_value) final {
-    assert(nullptr != codegen_utils &&
-           nullptr != llvm_out_value);
-    if (llvm_args.size() != this->GetTotalArgCount()) {
+    assert(nullptr != codegen_utils);
+    assert(nullptr != llvm_out_value);
+    std::vector<llvm::Value*> llvm_preproc_args;
+    if (!this->PreProcessArgs(codegen_utils,
+                              pg_func_info.llvm_args,
+                              &llvm_preproc_args)) {
       return false;
     }
+    PGFuncGeneratorInfo pg_processed_func_info(pg_func_info.llvm_main_func,
+                                               pg_func_info.llvm_error_block,
+                                               llvm_preproc_args);
     this->func_ptr()(codegen_utils,
-        llvm_main_func,
-        llvm_error_block,
-        llvm_args,
+        pg_processed_func_info,
         llvm_out_value);
     return true;
   }

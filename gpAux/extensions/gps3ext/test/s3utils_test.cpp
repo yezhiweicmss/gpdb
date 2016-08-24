@@ -1,20 +1,8 @@
 #include "s3utils.cpp"
 #include "gtest/gtest.h"
 
-// Tests factorial of positive numbers.
-TEST(Utils, trim) {
-    char data[] = " \t\n\r  abc \r\r\n\r \t";
-    char out[8] = {0};
-    bool ret;
-    ret = trim(out, data);
-    EXPECT_EQ(ret, true);
-    EXPECT_STREQ("abc", out);
-}
-
-TEST(Utils, time) {
-    char data[65];
-    gethttpnow(data);
-}
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 
 TEST(Utils, simplecurl) {
     CURL *c = CreateCurlHandler(NULL);
@@ -26,6 +14,7 @@ TEST(Utils, simplecurl) {
 
 TEST(Utils, nth) {
     const char *teststr = "aaabbbcccaaatttaaa";
+    EXPECT_EQ(find_Nth(teststr, 0, "aaa"), -1);
     EXPECT_EQ(find_Nth(teststr, 1, "aaa"), 0);
     EXPECT_EQ(find_Nth(teststr, 2, "aaa"), 9);
     EXPECT_EQ(find_Nth(teststr, 3, "aaa"), 15);
@@ -33,26 +22,26 @@ TEST(Utils, nth) {
     EXPECT_EQ(find_Nth(teststr, 1, ""), 0);
 }
 
-#define MD5TESTBUF "abcdefghijklmnopqrstuvwxyz\n"
+#define MD5TESTSTRING "abcdefghijklmnopqrstuvwxyz\n"
 TEST(Utils, md5) {
     MD5Calc m;
-    m.Update(MD5TESTBUF, strlen(MD5TESTBUF));
+    m.Update(MD5TESTSTRING, strlen(MD5TESTSTRING));
     EXPECT_STREQ("e302f9ecd2d189fa80aac1c3392e9b9c", m.Get());
-    m.Update(MD5TESTBUF, strlen(MD5TESTBUF));
-    m.Update(MD5TESTBUF, strlen(MD5TESTBUF));
-    m.Update(MD5TESTBUF, strlen(MD5TESTBUF));
+    m.Update(MD5TESTSTRING, strlen(MD5TESTSTRING));
+    m.Update(MD5TESTSTRING, strlen(MD5TESTSTRING));
+    m.Update(MD5TESTSTRING, strlen(MD5TESTSTRING));
     EXPECT_STREQ("3f8c2c6e2579e864071c33919fac61ee", m.Get());
 }
 
 #define TEST_STRING "The quick brown fox jumps over the lazy dog"
 TEST(Utils, sha256) {
-    char hash_str[65] = {0};
+    char hash_str[SHA256_DIGEST_STRING_LENGTH] = {0};
     EXPECT_TRUE(sha256_hex(TEST_STRING, hash_str));
     EXPECT_STREQ("d7a8fbb307d7809469ca9abcb0082e4f8d5651e46d3cdb762d02d0bf37c9e592", hash_str);
 }
 
 TEST(Utils, sha1hmac) {
-    char hash_hex[41] = {0};
+    char hash_hex[SHA_DIGEST_STRING_LENGTH] = {0};
 
     EXPECT_TRUE(sha1hmac_hex(TEST_STRING, (char *)hash_hex, "key", 3));
 
@@ -60,9 +49,22 @@ TEST(Utils, sha1hmac) {
 }
 
 TEST(Utils, sha256hmac) {
-    char hash_str[65] = {0};
+    char hash_str[SHA256_DIGEST_STRING_LENGTH] = {0};
     EXPECT_TRUE(sha256hmac_hex(TEST_STRING, hash_str, "key", 3));
     EXPECT_STREQ("f7bc83f430538424b13298e6aa6fb143ef4d59a14946175997479dbc2d1a3cd8", hash_str);
+}
+
+TEST(Utils, ConfigNull) {
+    Config c1(NULL);
+    uint64_t value = 0;
+    EXPECT_FALSE(c1.Scan("configtest", "config7", "%" PRIu64, &value));
+
+    Config c2("");
+    EXPECT_FALSE(c2.Scan("configtest", "config7", "%" PRIu64, &value));
+
+    string str;
+    Config c3(str);
+    EXPECT_FALSE(c3.Scan("configtest", "config7", "%" PRIu64, &value));
 }
 
 TEST(Utils, Config) {
@@ -80,18 +82,18 @@ TEST(Utils, Config) {
 
     EXPECT_EQ(c.Get("configtest", "", "xx"), "xx");
 
-    uint32_t value = 0;
-    EXPECT_TRUE(c.Scan("configtest", "config2", "%ud", &value));
+    uint64_t value = 0;
+    EXPECT_TRUE(c.Scan("configtest", "config2", "%" PRIu64, &value));
     EXPECT_EQ(value, 12345);
 
-    EXPECT_TRUE(c.Scan("configtest", "config4", "%ud", &value));
+    EXPECT_TRUE(c.Scan("configtest", "config4", "%" PRIu64, &value));
     EXPECT_EQ(value, 123);
 
-    EXPECT_FALSE(c.Scan("configtest", "config7", "%ud", &value));
-    EXPECT_FALSE(c.Scan("", "config7", "%ud", &value));
-    EXPECT_FALSE(c.Scan("configtest", "", "%ud", &value));
+    EXPECT_FALSE(c.Scan("configtest", "config7", "%" PRIu64, &value));
+    EXPECT_FALSE(c.Scan("", "config7", "%" PRIu64, &value));
+    EXPECT_FALSE(c.Scan("configtest", "", "%" PRIu64, &value));
 
-    EXPECT_FALSE(c.Scan("configtest", "config5", "%ud", &value));
+    EXPECT_FALSE(c.Scan("configtest", "config5", "%" PRIu64, &value));
 
     char str[128];
     EXPECT_TRUE(c.Scan("configtest", "config3", "%s", str));

@@ -9,43 +9,57 @@
 //    Object that generator code for variable expression.
 //
 //---------------------------------------------------------------------------
+#include <assert.h>
+#include <cstdint>
+#include <algorithm>
+#include <memory>
 
 #include "codegen/expr_tree_generator.h"
+#include "codegen/utils/gp_codegen_utils.h"
 #include "codegen/var_expr_tree_generator.h"
 
-#include "llvm/IR/Value.h"
+#include "llvm/IR/Constant.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
 
 extern "C" {
 #include "postgres.h"  // NOLINT(build/include)
-#include "utils/elog.h"
 #include "nodes/execnodes.h"
+#include "executor/tuptable.h"
+#include "nodes/nodes.h"
+#include "nodes/primnodes.h"
 }
+
+namespace llvm {
+class Value;
+}  // namespace llvm
 
 using gpcodegen::VarExprTreeGenerator;
 using gpcodegen::ExprTreeGenerator;
-using gpcodegen::CodegenUtils;
+using gpcodegen::GpCodegenUtils;
 
 bool VarExprTreeGenerator::VerifyAndCreateExprTree(
-    ExprState* expr_state,
-    ExprContext* econtext,
+    const ExprState* expr_state,
+    ExprTreeGeneratorInfo* gen_info,
     std::unique_ptr<ExprTreeGenerator>* expr_tree) {
   assert(nullptr != expr_state &&
          nullptr != expr_state->expr &&
          T_Var == nodeTag(expr_state->expr) &&
-         nullptr != expr_tree);
+         nullptr != expr_tree &&
+         nullptr != gen_info);
   expr_tree->reset(new VarExprTreeGenerator(expr_state));
+  gen_info->max_attr = std::max(gen_info->max_attr,
+                           reinterpret_cast<Var*>(expr_state->expr)->varattno);
   return true;
 }
 
-VarExprTreeGenerator::VarExprTreeGenerator(ExprState* expr_state) :
+VarExprTreeGenerator::VarExprTreeGenerator(const ExprState* expr_state) :
     ExprTreeGenerator(expr_state, ExprTreeNodeType::kVar) {
 }
 
-bool VarExprTreeGenerator::GenerateCode(CodegenUtils* codegen_utils,
-                                        ExprContext* econtext,
-                                        llvm::Function* llvm_main_func,
-                                        llvm::BasicBlock* llvm_error_block,
-                                        llvm::Value* llvm_isnull_arg,
+bool VarExprTreeGenerator::GenerateCode(GpCodegenUtils* codegen_utils,
+                                        const ExprTreeGeneratorInfo& gen_info,
+                                        llvm::Value* llvm_isnull_ptr,
                                         llvm::Value** llvm_out_value) {
   assert(nullptr != llvm_out_value);
   *llvm_out_value = nullptr;
@@ -57,18 +71,18 @@ bool VarExprTreeGenerator::GenerateCode(CodegenUtils* codegen_utils,
   // At code generation time, slot is NULL.
   // For that reason, we keep a double pointer to slot and at execution time
   // we load slot.
-  TupleTableSlot **ptr_to_slot_ptr = NULL;
+  TupleTableSlot **ptr_to_slot_ptr = nullptr;
   switch (var_expr->varno) {
     case INNER:  /* get the tuple from the inner node */
-      ptr_to_slot_ptr = &econtext->ecxt_innertuple;
+      ptr_to_slot_ptr = &gen_info.econtext->ecxt_innertuple;
       break;
 
     case OUTER:  /* get the tuple from the outer node */
-      ptr_to_slot_ptr = &econtext->ecxt_outertuple;
+      ptr_to_slot_ptr = &gen_info.econtext->ecxt_outertuple;
       break;
 
     default:     /* get the tuple from the relation being scanned */
-      ptr_to_slot_ptr = &econtext->ecxt_scantuple;
+      ptr_to_slot_ptr = &gen_info.econtext->ecxt_scantuple;
       break;
   }
 
@@ -79,15 +93,12 @@ bool VarExprTreeGenerator::GenerateCode(CodegenUtils* codegen_utils,
   llvm::Value *llvm_variable_varattno = codegen_utils->
       GetConstant<int32_t>(attnum);
 
-  // External functions
-  llvm::Function* llvm_slot_getattr =
-      codegen_utils->GetOrRegisterExternalFunction(slot_getattr);
-
+  assert(nullptr != gen_info.llvm_slot_getattr_func);
   // retrieve variable
   *llvm_out_value = irb->CreateCall(
-      llvm_slot_getattr, {
+      gen_info.llvm_slot_getattr_func, {
           llvm_slot,
           llvm_variable_varattno,
-          llvm_isnull_arg /* TODO: Fix isNull */ });
+          llvm_isnull_ptr /* TODO: Fix isNull */ });
   return true;
 }
